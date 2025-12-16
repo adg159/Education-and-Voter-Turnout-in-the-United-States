@@ -1,0 +1,167 @@
+---
+title: "Final Project Analysis: Education and Voter Turnout"
+author: "Andres Garcia"
+date: "2025-12-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Packages
+
+```{r}
+pkgs <- c("cpsvote", "dplyr", "ggplot2", "forcats", "broom")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(cpsvote)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(broom)
+```
+
+## Load CPS data (works reliably)
+
+```{r}
+# NOTE: The CRAN cpsvote "basic" dataset is consistent across years 1994–2018.
+# I use 2018 so the code knits cleanly and produces results/figures for the paper.
+YEAR <- 2018
+cps <- cps_load_basic(years = YEAR)
+
+# If you want to see what variables exist in YOUR install:
+# names(cps)
+```
+
+## Helper functions (robust variable finding)
+
+```{r}
+# Find the first column name that matches ANY of these regex patterns (case-insensitive)
+find_col_optional <- function(df, patterns) {
+  nm <- names(df)
+  for (pat in patterns) {
+    hit <- nm[grepl(pat, nm, ignore.case = TRUE)]
+    if (length(hit) > 0) return(hit[1])
+  }
+  return(NULL)
+}
+
+# Turn raw turnout into 0/1 (handles YES/NO or 0/1)
+to_voted01 <- function(x) {
+  if (is.numeric(x)) {
+    return(ifelse(x %in% c(0, 1), as.integer(x), NA_integer_))
+  }
+  x_chr <- as.character(x)
+  x_up  <- toupper(trimws(x_chr))
+  out <- dplyr::case_when(
+    x_up %in% c("YES", "VOTED", "VOTE") ~ 1L,
+    x_up %in% c("NO", "DID NOT VOTE", "DID NOT VOTED", "DIDNT VOTE") ~ 0L,
+    TRUE ~ NA_integer_
+  )
+  as.integer(out)
+}
+```
+
+## Select variables + clean
+
+```{r}
+# Try to locate the key fields. (These names vary a bit by dataset version.)
+col_turnout <- find_col_optional(cps, c("^hurachen_turnout$", "^cps_turnout$", "turnout"))
+col_educ    <- find_col_optional(cps, c("^educ$", "educ"))
+col_age     <- find_col_optional(cps, c("^age$", "age"))
+col_race    <- find_col_optional(cps, c("^race$", "race"))
+col_income  <- find_col_optional(cps, c("faminc", "family.*inc", "^inc$", "income"))
+
+# Turnout + education are required to answer your research question.
+if (is.null(col_turnout) || is.null(col_educ)) {
+  stop(
+    paste0(
+      "Missing required variable(s).\n",
+      "Found turnout column: ", col_turnout, "\n",
+      "Found education column: ", col_educ, "\n",
+      "Run names(cps) to inspect available variables."
+    ),
+    call. = FALSE
+  )
+}
+
+# Build analysis data with whatever controls exist.
+cps_work <- cps %>%
+  transmute(
+    voted = to_voted01(.data[[col_turnout]]),
+    educ  = .data[[col_educ]],
+    age   = if (!is.null(col_age)) .data[[col_age]] else NA,
+    race  = if (!is.null(col_race)) .data[[col_race]] else NA,
+    faminc = if (!is.null(col_income)) .data[[col_income]] else NA
+  ) %>%
+  filter(voted %in% c(0, 1)) %>%
+  filter(!is.na(educ))
+
+# Drop rows with missing controls only if those controls exist
+if (!is.null(col_age))    cps_work <- cps_work %>% filter(!is.na(age))
+if (!is.null(col_race))   cps_work <- cps_work %>% filter(!is.na(race))
+if (!is.null(col_income)) cps_work <- cps_work %>% filter(!is.na(faminc))
+
+cps_work %>% summarise(rows = n())
+```
+
+## Descriptive stats: turnout by education
+
+```{r}
+turnout_by_educ <- cps_work %>%
+  group_by(educ) %>%
+  summarise(
+    turnout_rate = mean(voted, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+turnout_by_educ
+```
+
+## Visualization (required)
+
+```{r fig.width=9, fig.height=5}
+plot_df <- turnout_by_educ %>%
+  mutate(educ = fct_reorder(educ, turnout_rate))
+
+ggplot(plot_df, aes(x = educ, y = turnout_rate)) +
+  geom_col() +
+  labs(
+    title = paste0("Voter Turnout by Educational Attainment (CPS ", YEAR, ")"),
+    x = "Educational Attainment",
+    y = "Proportion Who Voted"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+## Logistic regression
+
+```{r}
+# Build the model formula based on which controls are actually available
+rhs <- c("educ")
+if (!is.null(col_age)) rhs <- c(rhs, "age")
+if (!is.null(col_race)) rhs <- c(rhs, "race")
+if (!is.null(col_income)) rhs <- c(rhs, "faminc")
+
+fml <- as.formula(paste("voted ~", paste(rhs, collapse = " + ")))
+fml
+```
+
+```{r}
+turnout_model <- glm(
+  fml,
+  data = cps_work,
+  family = binomial
+)
+
+summary(turnout_model)
+```
+
+```{r}
+# Odds ratios table (easier to interpret than log-odds)
+broom::tidy(turnout_model, conf.int = TRUE, exponentiate = TRUE)
+```
